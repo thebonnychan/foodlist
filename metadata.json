@@ -1,0 +1,6 @@
+{
+  "name": "YURFAT",
+  "description": "US restaurant search, Yelp list organizer, and CSV exporter for logging places you want to go and have been.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
