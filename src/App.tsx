@@ -3,12 +3,11 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import {
   Search,
   List,
   Settings as SettingsIcon,
-  Download,
   CheckCircle2,
   Share2,
   X
@@ -20,7 +19,8 @@ import {
   WillGoBackMarker,
   SharedListPayload,
   DEFAULT_WANT_TO_GO_ID,
-  DEFAULT_BEEN_HERE_ID
+  DEFAULT_BEEN_HERE_ID,
+  DEFAULT_FALLBACK_LOCATION
 } from './types';
 import {
   INITIAL_US_RESTAURANTS,
@@ -38,7 +38,8 @@ type ActiveTab = 'search' | 'lists' | 'settings';
 const STORAGE_KEYS = {
   RESTAURANTS: 'yurfat_restaurants_v1',
   LISTS: 'yurfat_lists_v1',
-  SETTINGS: 'yurfat_settings_v1'
+  SETTINGS: 'yurfat_settings_v1',
+  PRIVATE_USER_API_KEY: 'yurfat_private_gemini_api_key_v1'
 };
 
 function buildInitialRestaurantsMap(): Record<string, Restaurant> {
@@ -53,7 +54,7 @@ export default function App() {
   // Navigation Tab State: Home Screen is Search Screen (Requirement 1)
   const [activeTab, setActiveTab] = useState<ActiveTab>('search');
 
-  // Normalized Restaurant Store (keyed by restaurant.id so notes & ratings sync across all lists)
+  // Normalized Restaurant Store
   const [restaurantsMap, setRestaurantsMap] = useState<Record<string, Restaurant>>(() => {
     try {
       const saved = localStorage.getItem(STORAGE_KEYS.RESTAURANTS);
@@ -76,7 +77,6 @@ export default function App() {
       if (saved) {
         const parsed = JSON.parse(saved);
         if (Array.isArray(parsed) && parsed.length >= 2) {
-          // Ensure "Want to Go" and "Been Here" always exist
           const hasWantToGo = parsed.some((l: SavedList) => l.id === DEFAULT_WANT_TO_GO_ID);
           const hasBeenHere = parsed.some((l: SavedList) => l.id === DEFAULT_BEEN_HERE_ID);
           if (hasWantToGo && hasBeenHere) {
@@ -90,25 +90,46 @@ export default function App() {
     return INITIAL_SAVED_LISTS;
   });
 
-  // User Preferences / Settings Store
+  // User Preferences / Settings Store (Default location falls back to New York, NY)
   const [settings, setSettings] = useState<AppSettings>(() => {
     try {
       const saved = localStorage.getItem(STORAGE_KEYS.SETTINGS);
       if (saved) {
-        return JSON.parse(saved);
+        const parsed = JSON.parse(saved);
+        return {
+          defaultLocation:
+            parsed.defaultLocation && parsed.defaultLocation !== 'All United States'
+              ? parsed.defaultLocation
+              : DEFAULT_FALLBACK_LOCATION,
+          userManuallySetLocation: Boolean(parsed.userManuallySetLocation),
+          defaultSortBy: parsed.defaultSortBy || 'dateAdded',
+          includeEmptyWillGoBackInCsv: parsed.includeEmptyWillGoBackInCsv ?? true
+        };
       }
     } catch {
       // Fallback
     }
     return {
-      defaultLocation: 'All United States',
+      defaultLocation: DEFAULT_FALLBACK_LOCATION,
+      userManuallySetLocation: false,
       defaultSortBy: 'dateAdded',
       includeEmptyWillGoBackInCsv: true
     };
   });
 
-  // Currently selected list ID in the Lists tab
-  const [activeListId, setActiveListId] = useState<string>(DEFAULT_WANT_TO_GO_ID);
+  // Private, browser-localized Google Gemini API Key (never shared or exported)
+  const [userGeminiApiKey, setUserGeminiApiKey] = useState<string>(() => {
+    try {
+      return localStorage.getItem(STORAGE_KEYS.PRIVATE_USER_API_KEY) || '';
+    } catch {
+      return '';
+    }
+  });
+
+  const [isLocatingUser, setIsLocatingUser] = useState(false);
+
+  // Opened list ID inside the My Lists tab (null = show All Lists screen; string = show Single List Detail screen)
+  const [openedListId, setOpenedListId] = useState<string | null>(null);
 
   // Modal states
   const [modalRestaurant, setModalRestaurant] = useState<Restaurant | null>(null);
@@ -121,14 +142,100 @@ export default function App() {
   // Toast feedback banner
   const [toastMessage, setToastMessage] = useState<string | null>(null);
 
-  const showToast = (msg: string) => {
+  const showToast = useCallback((msg: string) => {
     setToastMessage(msg);
     setTimeout(() => {
       setToastMessage((prev) => (prev === msg ? null : prev));
     }, 3200);
-  };
+  }, []);
 
-  // Persist state changes to localStorage
+  // Prompt the user for browser geolocation and set default location if allowed, or fallback to New York City ("New York, NY")
+  const requestUserGeolocation = useCallback(
+    (isManualTrigger = false) => {
+      if (typeof navigator === 'undefined' || !navigator.geolocation) {
+        setSettings((prev) => ({
+          ...prev,
+          defaultLocation: prev.userManuallySetLocation
+            ? prev.defaultLocation
+            : DEFAULT_FALLBACK_LOCATION
+        }));
+        if (isManualTrigger) {
+          showToast('Location unavailable; defaulted to New York, NY');
+        }
+        return;
+      }
+
+      setIsLocatingUser(true);
+      navigator.geolocation.getCurrentPosition(
+        async (position) => {
+          try {
+            const { latitude, longitude } = position.coords;
+            const res = await fetch(
+              `/api/reverse-geocode?lat=${encodeURIComponent(
+                String(latitude)
+              )}&lon=${encodeURIComponent(String(longitude))}`
+            );
+            if (res.ok) {
+              const data = await res.json();
+              const detectedLocation =
+                data?.isUs && data?.location ? String(data.location) : DEFAULT_FALLBACK_LOCATION;
+              setSettings((prev) => ({
+                ...prev,
+                defaultLocation: detectedLocation,
+                userManuallySetLocation: isManualTrigger ? true : prev.userManuallySetLocation
+              }));
+              if (data?.isUs) {
+                showToast(`Location set to ${detectedLocation}`);
+              } else if (isManualTrigger) {
+                showToast('Outside U.S. — defaulted to New York, NY');
+              }
+            } else {
+              setSettings((prev) => ({
+                ...prev,
+                defaultLocation: prev.userManuallySetLocation
+                  ? prev.defaultLocation
+                  : DEFAULT_FALLBACK_LOCATION
+              }));
+            }
+          } catch {
+            setSettings((prev) => ({
+              ...prev,
+              defaultLocation: prev.userManuallySetLocation
+                ? prev.defaultLocation
+                : DEFAULT_FALLBACK_LOCATION
+            }));
+          } finally {
+            setIsLocatingUser(false);
+          }
+        },
+        () => {
+          setIsLocatingUser(false);
+          setSettings((prev) => ({
+            ...prev,
+            defaultLocation: prev.userManuallySetLocation
+              ? prev.defaultLocation
+              : DEFAULT_FALLBACK_LOCATION
+          }));
+          if (isManualTrigger) {
+            showToast('Location access declined — defaulted to New York, NY');
+          }
+        },
+        {
+          enableHighAccuracy: false,
+          timeout: 8000,
+          maximumAge: 300000
+        }
+      );
+    },
+    [showToast]
+  );
+
+  useEffect(() => {
+    if (!settings.userManuallySetLocation) {
+      requestUserGeolocation(false);
+    }
+  }, []);
+
   useEffect(() => {
     try {
       localStorage.setItem(STORAGE_KEYS.RESTAURANTS, JSON.stringify(restaurantsMap));
@@ -153,7 +260,20 @@ export default function App() {
     }
   }, [settings]);
 
-  // Check URL query parameter `?share=` on initial load for zero-account list sharing
+  const handleUpdateUserGeminiApiKey = (newKey: string) => {
+    const trimmed = newKey.trim();
+    setUserGeminiApiKey(trimmed);
+    try {
+      if (trimmed) {
+        localStorage.setItem(STORAGE_KEYS.PRIVATE_USER_API_KEY, trimmed);
+      } else {
+        localStorage.removeItem(STORAGE_KEYS.PRIVATE_USER_API_KEY);
+      }
+    } catch {
+      // Ignore storage error
+    }
+  };
+
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const shareParam = params.get('share');
@@ -165,7 +285,6 @@ export default function App() {
     }
   }, []);
 
-  // Register newly discovered U.S. restaurants from live Gemini Yelp search while preserving existing user notes/ratings
   const handleRegisterDiscoveredRestaurants = (discovered: Restaurant[]) => {
     setRestaurantsMap((prev) => {
       const next = { ...prev };
@@ -185,7 +304,6 @@ export default function App() {
     });
   };
 
-  // Create a new custom list (Requirement 3, 4, 7)
   const handleCreateList = (name: string, description: string): SavedList => {
     const now = new Date().toISOString();
     const id = `list-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
@@ -203,7 +321,6 @@ export default function App() {
     return newList;
   };
 
-  // Modify list name / description (Requirement 3)
   const handleUpdateList = (listId: string, name: string, description: string) => {
     setLists((prev) =>
       prev.map((l) => {
@@ -219,7 +336,6 @@ export default function App() {
     showToast('Updated list details');
   };
 
-  // Mass delete custom lists (Requirement 13)
   const handleMassDeleteLists = (listIdsToDelete: string[]) => {
     const safeToDelete = listIdsToDelete.filter(
       (id) => id !== DEFAULT_WANT_TO_GO_ID && id !== DEFAULT_BEEN_HERE_ID
@@ -227,15 +343,14 @@ export default function App() {
     if (safeToDelete.length === 0) return;
 
     setLists((prev) => prev.filter((l) => !safeToDelete.includes(l.id)));
-    if (safeToDelete.includes(activeListId)) {
-      setActiveListId(DEFAULT_WANT_TO_GO_ID);
+    if (openedListId && safeToDelete.includes(openedListId)) {
+      setOpenedListId(null);
     }
     showToast(
       `Deleted ${safeToDelete.length} custom list${safeToDelete.length === 1 ? '' : 's'}`
     );
   };
 
-  // Save restaurant list assignments, shared note, 1-5 rating, and Will Go Back marker (Requirements 7, 9, 10, 15, 16, 17)
   const handleSaveRestaurantModal = ({
     restaurant,
     selectedListIds,
@@ -249,7 +364,6 @@ export default function App() {
     notes: string;
     willGoBack: WillGoBackMarker;
   }) => {
-    // Enforce mutual exclusivity safeguard: never allow both Want to Go and Been Here simultaneously
     let validatedListIds = [...selectedListIds];
     if (
       validatedListIds.includes(DEFAULT_WANT_TO_GO_ID) &&
@@ -258,7 +372,6 @@ export default function App() {
       validatedListIds = validatedListIds.filter((id) => id !== DEFAULT_WANT_TO_GO_ID);
     }
 
-    // Update normalized restaurant record (syncs notes, userRating, and willGoBack across all lists)
     setRestaurantsMap((prev) => ({
       ...prev,
       [restaurant.id]: {
@@ -298,7 +411,6 @@ export default function App() {
     showToast(`Saved "${restaurant.name}" (${validatedListIds.length} list${validatedListIds.length === 1 ? '' : 's'})`);
   };
 
-  // Inline update of restaurant rating, note, or Will Go Back (Y/N) from inside any list view
   const handleUpdateRestaurantDetails = (
     restaurantId: string,
     updates: Partial<Pick<Restaurant, 'userRating' | 'notes' | 'willGoBack'>>
@@ -316,7 +428,6 @@ export default function App() {
     });
   };
 
-  // Multi-select remove restaurants from a specific list (Requirement 12)
   const handleBatchRemoveRestaurantsFromList = (
     listId: string,
     restaurantIdsToRemove: string[]
@@ -339,7 +450,6 @@ export default function App() {
     );
   };
 
-  // Import a shared list from URL token or Settings input
   const handleImportSharedPayload = (payload: SharedListPayload) => {
     setRestaurantsMap((prev) => {
       const next = { ...prev };
@@ -376,11 +486,10 @@ export default function App() {
     };
 
     setLists((prev) => [...prev, newList]);
-    setActiveListId(newListId);
+    setOpenedListId(newListId);
     setActiveTab('lists');
     setIncomingSharedPayload(null);
 
-    // Clean ?share= param from URL bar
     if (window.location.search.includes('share=')) {
       window.history.replaceState({}, document.title, window.location.pathname);
     }
@@ -437,7 +546,7 @@ export default function App() {
   const handleResetToDemoData = () => {
     setRestaurantsMap(buildInitialRestaurantsMap());
     setLists(INITIAL_SAVED_LISTS);
-    setActiveListId(DEFAULT_WANT_TO_GO_ID);
+    setOpenedListId(null);
     showToast('Reset to starter U.S. restaurants and default lists');
   };
 
@@ -474,19 +583,18 @@ export default function App() {
     ];
     setRestaurantsMap(clearedMap);
     setLists(emptyDefaults);
-    setActiveListId(DEFAULT_WANT_TO_GO_ID);
+    setOpenedListId(null);
     showToast('Cleared all saved lists, ratings, and notes');
   };
 
   const totalSavedEntries = lists.reduce((acc, l) => acc + l.items.length, 0);
-  const currentActiveList = lists.find((l) => l.id === activeListId) || lists[0];
 
   return (
     <div className="min-h-screen flex flex-col bg-[#FAF9F6] text-zinc-900">
-      {/* Top Bar Contract: 3 Zones separated by gap-8 */}
+      {/* Top Navigation Bar */}
       <header className="sticky top-0 z-30 border-b border-zinc-200 bg-white/95 backdrop-blur-xs">
         <div className="mx-auto flex max-w-6xl items-center justify-between gap-8 px-4 py-3.5 sm:px-6">
-          {/* Zone 1: Single text element wordmark */}
+          {/* Brand wordmark */}
           <button
             type="button"
             onClick={() => setActiveTab('search')}
@@ -495,7 +603,7 @@ export default function App() {
             YURFAT
           </button>
 
-          {/* Zone 2: Concise single-line text navigation links */}
+          {/* Navigation tabs */}
           <nav className="flex items-center gap-6 text-sm font-medium text-zinc-600">
             <button
               type="button"
@@ -512,7 +620,10 @@ export default function App() {
 
             <button
               type="button"
-              onClick={() => setActiveTab('lists')}
+              onClick={() => {
+                setActiveTab('lists');
+                setOpenedListId(null);
+              }}
               className={`inline-flex items-center gap-1.5 py-1 transition-colors whitespace-nowrap shrink-0 ${
                 activeTab === 'lists'
                   ? 'text-zinc-950 font-bold underline decoration-[#D32323] decoration-2 underline-offset-8'
@@ -536,22 +647,10 @@ export default function App() {
               <span>Settings</span>
             </button>
           </nav>
-
-          {/* Zone 3: 1 Primary Action */}
-          <div className="flex items-center shrink-0">
-            <button
-              type="button"
-              onClick={() => setCsvModalList(currentActiveList)}
-              className="inline-flex items-center gap-1.5 rounded-lg bg-zinc-900 px-3.5 py-2 text-xs font-semibold text-white hover:bg-zinc-800 transition-colors whitespace-nowrap shrink-0"
-            >
-              <Download className="h-3.5 w-3.5" />
-              <span>Export CSV</span>
-            </button>
-          </div>
         </div>
       </header>
 
-      {/* Incoming Shared List Banner (when user opens a ?share=... URL) */}
+      {/* Incoming Shared List Banner */}
       {incomingSharedPayload && (
         <div className="border-b border-amber-200 bg-amber-50 px-4 py-3">
           <div className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-3 text-xs text-amber-950">
@@ -590,6 +689,9 @@ export default function App() {
             restaurantsMap={restaurantsMap}
             lists={lists}
             defaultLocation={settings.defaultLocation}
+            isLocatingUser={isLocatingUser}
+            userGeminiApiKey={userGeminiApiKey}
+            onRequestUserLocation={() => requestUserGeolocation(true)}
             onOpenSaveModal={(restaurant) => setModalRestaurant(restaurant)}
             onRegisterDiscoveredRestaurants={handleRegisterDiscoveredRestaurants}
           />
@@ -599,9 +701,9 @@ export default function App() {
           <ListsView
             lists={lists}
             restaurantsMap={restaurantsMap}
-            activeListId={activeListId}
+            openedListId={openedListId}
             defaultSortBy={settings.defaultSortBy}
-            onSelectList={(id) => setActiveListId(id)}
+            onOpenList={(id) => setOpenedListId(id)}
             onCreateList={handleCreateList}
             onUpdateList={handleUpdateList}
             onMassDeleteLists={handleMassDeleteLists}
@@ -618,9 +720,13 @@ export default function App() {
             settings={settings}
             lists={lists}
             restaurantsMap={restaurantsMap}
+            userGeminiApiKey={userGeminiApiKey}
+            isLocatingUser={isLocatingUser}
             onUpdateSettings={(newSettings) =>
               setSettings((prev) => ({ ...prev, ...newSettings }))
             }
+            onUpdateUserGeminiApiKey={handleUpdateUserGeminiApiKey}
+            onRequestUserLocation={() => requestUserGeolocation(true)}
             onImportSharedLinkOrToken={handleImportSharedLinkOrToken}
             onImportFullBackupJson={handleImportFullBackupJson}
             onResetToDemoData={handleResetToDemoData}
@@ -633,10 +739,10 @@ export default function App() {
       <footer className="border-t border-zinc-200 bg-white py-5 text-xs text-zinc-500">
         <div className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-4 px-4 sm:px-6">
           <div>
-            <strong className="font-display font-bold text-zinc-800">YURFAT</strong> · United States Restaurant Search & CSV List Organizer
+            <strong className="font-display font-bold text-zinc-800">YURFAT</strong>
           </div>
           <div className="font-mono tabular-nums">
-            {lists.length} Lists · {totalSavedEntries} Saved Entries · Account-Free Browser Storage
+            Default: {settings.defaultLocation} · {lists.length} Lists · {totalSavedEntries} Saved Entries
           </div>
         </div>
       </footer>

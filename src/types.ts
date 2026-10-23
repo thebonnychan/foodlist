@@ -17,6 +17,7 @@ export interface Restaurant {
   phone?: string;
   neighborhood?: string;
   highlights?: string[];
+  imageUrl?: string;
   // User-managed fields synced globally across all lists containing this restaurant
   userRating: number; // 0 = unrated, 1-5 stars
   notes: string;
@@ -40,6 +41,7 @@ export interface SavedList {
 
 export interface AppSettings {
   defaultLocation: string;
+  userManuallySetLocation?: boolean;
   defaultSortBy: SortOption;
   includeEmptyWillGoBackInCsv: boolean;
 }
@@ -56,3 +58,4 @@ export interface SharedListPayload {
 
 export const DEFAULT_WANT_TO_GO_ID = 'want-to-go';
 export const DEFAULT_BEEN_HERE_ID = 'been-here';
+export const DEFAULT_FALLBACK_LOCATION = 'New York, NY';

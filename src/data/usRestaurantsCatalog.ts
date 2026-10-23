@@ -20,7 +20,7 @@ const NON_US_KEYWORDS = [
 export function validateUsLocation(locationInput: string): { valid: boolean; reason?: string } {
   const trimmed = locationInput.trim().toLowerCase();
   if (!trimmed) {
-    return { valid: true }; // Default to all US when empty
+    return { valid: true };
   }
 
   for (const keyword of NON_US_KEYWORDS) {
@@ -34,6 +34,181 @@ export function validateUsLocation(locationInput: string): { valid: boolean; rea
   }
 
   return { valid: true };
+}
+
+/**
+ * Normalizes a text string into stemmed tokens, stripping apostrophes ('s, s')
+ * and trailing 's' on words > 3 chars so "Peter Luger's" or "peter lugers" -> ["peter", "luger"]
+ */
+export function normalizeToStemmedTokens(input: string): string[] {
+  return input
+    .toLowerCase()
+    .replace(/['’`]/g, '')
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((word) => {
+      if (word.length > 3 && word.endsWith('es') && !word.endsWith('ches') && !word.endsWith('shes')) {
+        return word.slice(0, -1); // e.g. "bakers" / "lugers" -> "luger"
+      }
+      if (word.length > 3 && word.endsWith('s') && !word.endsWith('ss') && !word.endsWith('us')) {
+        return word.slice(0, -1);
+      }
+      return word;
+    });
+}
+
+/**
+ * Computes Levenshtein edit distance between two short strings for typo tolerance
+ */
+function editDistance(a: string, b: string): number {
+  if (a === b) return 0;
+  if (a.length === 0) return b.length;
+  if (b.length === 0) return a.length;
+
+  const matrix: number[][] = [];
+  for (let i = 0; i <= b.length; i++) {
+    matrix[i] = [i];
+  }
+  for (let j = 0; j <= a.length; j++) {
+    matrix[0][j] = j;
+  }
+
+  for (let i = 1; i <= b.length; i++) {
+    for (let j = 1; j <= a.length; j++) {
+      if (b.charAt(i - 1) === a.charAt(j - 1)) {
+        matrix[i][j] = matrix[i - 1][j - 1];
+      } else {
+        matrix[i][j] = Math.min(
+          matrix[i - 1][j - 1] + 1,
+          matrix[i][j - 1] + 1,
+          matrix[i - 1][j] + 1
+        );
+      }
+    }
+  }
+  return matrix[b.length][a.length];
+}
+
+/**
+ * Returns a match score (0 = no match, > 0 = strong fuzzy/stemmed match)
+ * Handles possessives ("Peter Luger's", "peter lugers"), missing apostrophes ("katzs"), and minor spelling errors.
+ */
+export function scoreRestaurantMatch(restaurant: Restaurant, rawQuery: string): number {
+  const q = rawQuery.trim().toLowerCase();
+  if (!q) return 1;
+
+  const cleanName = restaurant.name.trim().toLowerCase();
+  const cleanNameNoPunct = cleanName.replace(/['’`]/g, '').replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+  const cleanQueryNoPunct = q.replace(/['’`]/g, '').replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+
+  // 1. Exact name match (highest priority)
+  if (cleanName === q || cleanNameNoPunct === cleanQueryNoPunct) {
+    return 1000;
+  }
+
+  const queryTokens = normalizeToStemmedTokens(rawQuery);
+  const nameTokens = normalizeToStemmedTokens(restaurant.name);
+
+  if (queryTokens.length > 0 && nameTokens.length > 0) {
+    if (nameTokens.join(' ') === queryTokens.join(' ')) {
+      return 950;
+    }
+  }
+
+  // 2. Restaurant name starts with query
+  if (cleanName.startsWith(q) || cleanNameNoPunct.startsWith(cleanQueryNoPunct)) {
+    return 600;
+  }
+
+  // 3. Restaurant name contains full query substring
+  if (cleanName.includes(q) || cleanNameNoPunct.includes(cleanQueryNoPunct)) {
+    return 400;
+  }
+
+  const searchableText = [
+    restaurant.name,
+    restaurant.cuisineType,
+    restaurant.neighborhood || '',
+    restaurant.city,
+    restaurant.state,
+    ...(restaurant.highlights || [])
+  ]
+    .join(' ')
+    .toLowerCase();
+
+  if (queryTokens.length === 0) return 1;
+
+  const allTargetTokens = normalizeToStemmedTokens(searchableText);
+
+  let matchedTokens = 0;
+  let nameMatchedTokens = 0;
+  let score = 0;
+
+  for (const qToken of queryTokens) {
+    // Check exact stemmed match in restaurant name
+    const nameExact = nameTokens.some((nToken) => nToken === qToken);
+    if (nameExact) {
+      matchedTokens++;
+      nameMatchedTokens++;
+      score += 80;
+      continue;
+    }
+
+    // Check prefix match in restaurant name (only when token has at least 3 chars)
+    const namePrefix =
+      qToken.length >= 3 &&
+      nameTokens.some(
+        (nToken) =>
+          (nToken.length >= 3 && nToken.startsWith(qToken)) ||
+          (nToken.length >= 4 && qToken.startsWith(nToken))
+      );
+    if (namePrefix) {
+      matchedTokens++;
+      nameMatchedTokens++;
+      score += 50;
+      continue;
+    }
+
+    // Check typo-tolerant match in restaurant name (edit distance <= 1 for 5+ chars, <= 2 for 7+ chars)
+    const maxDist = qToken.length >= 7 ? 2 : qToken.length >= 5 ? 1 : 0;
+    if (maxDist > 0) {
+      const nameTypoMatch = nameTokens.some(
+        (nToken) =>
+          Math.abs(nToken.length - qToken.length) <= maxDist &&
+          editDistance(nToken, qToken) <= maxDist
+      );
+      if (nameTypoMatch) {
+        matchedTokens++;
+        nameMatchedTokens++;
+        score += 35;
+        continue;
+      }
+    }
+
+    // Check match across cuisine, city, highlights (only for single-word cuisine searches or supporting words)
+    const targetMatch = allTargetTokens.some(
+      (tToken) => tToken === qToken || (qToken.length >= 4 && tToken.startsWith(qToken))
+    );
+    if (targetMatch) {
+      matchedTokens++;
+      score += 15;
+    }
+  }
+
+  // If the user typed a multi-word query (like "esse taco"), require at least one word to match the restaurant NAME itself
+  if (queryTokens.length >= 2 && nameMatchedTokens === 0) {
+    return 0;
+  }
+
+  // If all query tokens matched in the restaurant name itself, give a strong bonus
+  if (nameMatchedTokens === queryTokens.length) {
+    score += 200;
+  }
+
+  const threshold =
+    queryTokens.length >= 3 ? Math.ceil(queryTokens.length * 0.75) : queryTokens.length;
+  return matchedTokens >= threshold ? score : 0;
 }
 
 export const POPULAR_US_CITIES = [
@@ -54,6 +229,134 @@ export const POPULAR_US_CITIES = [
 ];
 
 export const INITIAL_US_RESTAURANTS: Restaurant[] = [
+  {
+    id: 'esse-taco-brooklyn-ny',
+    name: 'Esse Taco',
+    cuisineType: 'Tacos, Mexican',
+    yelpUrl: 'https://www.yelp.com/biz/esse-taco-brooklyn',
+    yelpRating: 4.1,
+    reviewCount: 118,
+    price: '$$',
+    address: '219 Bedford Ave',
+    city: 'Brooklyn',
+    state: 'NY',
+    zipCode: '11211',
+    neighborhood: 'Williamsburg',
+    highlights: ['Ribeye Taco', 'Al Pastor Taco', 'Heritage Corn Tortillas'],
+    userRating: 0,
+    notes: '',
+    willGoBack: ''
+  },
+  {
+    id: 'los-tacos-no-1-new-york-ny',
+    name: 'Los Tacos No. 1',
+    cuisineType: 'Tacos, Mexican',
+    yelpUrl: 'https://www.yelp.com/biz/los-tacos-no-1-new-york',
+    yelpRating: 4.6,
+    reviewCount: 4420,
+    price: '$',
+    address: '75 9th Ave',
+    city: 'New York',
+    state: 'NY',
+    zipCode: '10011',
+    neighborhood: 'Chelsea Market',
+    highlights: ['Adobada Taco', 'Carne Asada Taco', 'Quesadilla & Horchata'],
+    userRating: 0,
+    notes: '',
+    willGoBack: ''
+  },
+  {
+    id: 'l-industrie-pizzeria-brooklyn-ny',
+    name: "L'Industrie Pizzeria",
+    cuisineType: 'Pizza, Italian',
+    yelpUrl: 'https://www.yelp.com/biz/l-industrie-pizzeria-brooklyn',
+    yelpRating: 4.7,
+    reviewCount: 1890,
+    price: '$',
+    address: '254 S 2nd St',
+    city: 'Brooklyn',
+    state: 'NY',
+    zipCode: '11211',
+    neighborhood: 'Williamsburg',
+    highlights: ['Burrata Slice', 'Fig Jam & Bacon Slice', 'Spicy Soppressata Slice'],
+    userRating: 0,
+    notes: '',
+    willGoBack: ''
+  },
+  {
+    id: 'scarrs-pizza-new-york-ny',
+    name: "Scarr's Pizza",
+    cuisineType: 'Pizza, Italian',
+    yelpUrl: 'https://www.yelp.com/biz/scarrs-pizza-new-york',
+    yelpRating: 4.2,
+    reviewCount: 1650,
+    price: '$',
+    address: '35 Orchard St',
+    city: 'New York',
+    state: 'NY',
+    zipCode: '10002',
+    neighborhood: 'Lower East Side',
+    highlights: ['Hot Boi Beef Pepperoni Slice', 'Sicilian Slice', 'Fresh Milled Grain Crust'],
+    userRating: 0,
+    notes: '',
+    willGoBack: ''
+  },
+  {
+    id: 'cote-korean-steakhouse-new-york-ny',
+    name: 'COTE Korean Steakhouse',
+    cuisineType: 'Korean, Steakhouses, Barbeque',
+    yelpUrl: 'https://www.yelp.com/biz/cote-korean-steakhouse-new-york',
+    yelpRating: 4.6,
+    reviewCount: 3120,
+    price: '$$$$',
+    address: '16 W 22nd St',
+    city: 'New York',
+    state: 'NY',
+    zipCode: '10010',
+    neighborhood: 'Flatiron',
+    highlights: ["Butcher's Feast", 'Steak & Eggs', 'Dry-Aged Ribeye'],
+    userRating: 0,
+    notes: '',
+    willGoBack: ''
+  },
+  {
+    id: 'peter-luger-steak-house-brooklyn-ny',
+    name: 'Peter Luger Steak House',
+    cuisineType: 'Steakhouses, Traditional American, Butcher Shop',
+    yelpUrl: 'https://www.yelp.com/biz/peter-luger-brooklyn-2',
+    yelpRating: 4.4,
+    reviewCount: 7120,
+    price: '$$$$',
+    address: '178 Broadway',
+    city: 'Brooklyn',
+    state: 'NY',
+    zipCode: '11211',
+    phone: '(718) 387-7400',
+    neighborhood: 'Williamsburg, New York',
+    highlights: ['USDA Prime Dry-Aged Porterhouse Steak for Two', 'Sizzling Extra Thick Bacon', 'German Fried Potatoes & Holy Cow Sundae'],
+    userRating: 0,
+    notes: '',
+    willGoBack: ''
+  },
+  {
+    id: 'peter-luger-steak-house-great-neck-ny',
+    name: 'Peter Luger Steak House (Great Neck)',
+    cuisineType: 'Steakhouses, Traditional American',
+    yelpUrl: 'https://www.yelp.com/biz/peter-luger-great-neck',
+    yelpRating: 4.4,
+    reviewCount: 2490,
+    price: '$$$$',
+    address: '255 Northern Blvd',
+    city: 'Great Neck',
+    state: 'NY',
+    zipCode: '11021',
+    phone: '(516) 487-8800',
+    neighborhood: 'Long Island, New York',
+    highlights: ['Dry-Aged Porterhouse Steak', 'Sliced Tomatoes & Onions with Luger Sauce', 'Creamed Spinach'],
+    userRating: 0,
+    notes: '',
+    willGoBack: ''
+  },
   {
     id: 'katzs-delicatessen-new-york',
     name: "Katz's Delicatessen",
@@ -205,6 +508,63 @@ export const INITIAL_US_RESTAURANTS: Restaurant[] = [
     userRating: 3,
     notes: 'Key lime pie is incredible, though stone crab prices have gotten very steep.',
     willGoBack: 'N'
+  },
+  {
+    id: 'carbone-new-york',
+    name: 'Carbone',
+    cuisineType: 'Italian, Fine Dining, Pasta',
+    yelpUrl: 'https://www.yelp.com/biz/carbone-new-york',
+    yelpRating: 4.4,
+    reviewCount: 2150,
+    price: '$$$$',
+    address: '181 Thompson St',
+    city: 'New York',
+    state: 'NY',
+    zipCode: '10012',
+    phone: '(212) 254-3000',
+    neighborhood: 'Greenwich Village',
+    highlights: ['Spicy Rigatoni Vodka', 'Veal Parmesan', 'Caesar alla ZZ'],
+    userRating: 0,
+    notes: '',
+    willGoBack: ''
+  },
+  {
+    id: 'russ-and-daughters-new-york',
+    name: 'Russ & Daughters',
+    cuisineType: 'Bagels, Delis, Smoked Fish',
+    yelpUrl: 'https://www.yelp.com/biz/russ-and-daughters-new-york',
+    yelpRating: 4.6,
+    reviewCount: 3920,
+    price: '$$',
+    address: '179 E Houston St',
+    city: 'New York',
+    state: 'NY',
+    zipCode: '10002',
+    phone: '(212) 475-4880',
+    neighborhood: 'Lower East Side',
+    highlights: ['Classic Bagel with Gaspe Nova Smoked Salmon & Cream Cheese', 'Babka', 'Caviar'],
+    userRating: 0,
+    notes: '',
+    willGoBack: ''
+  },
+  {
+    id: 'robertas-brooklyn-ny',
+    name: "Roberta's",
+    cuisineType: 'Pizza, Italian, Wood-Fired',
+    yelpUrl: 'https://www.yelp.com/biz/robertas-brooklyn',
+    yelpRating: 4.4,
+    reviewCount: 3680,
+    price: '$$',
+    address: '261 Moore St',
+    city: 'Brooklyn',
+    state: 'NY',
+    zipCode: '11206',
+    phone: '(718) 417-1118',
+    neighborhood: 'Bushwick, New York',
+    highlights: ['Bee Sting Pizza (Soppressata, Chili, Honey)', 'Margherita Pizza', 'Stracciatella'],
+    userRating: 0,
+    notes: '',
+    willGoBack: ''
   },
   {
     id: 'zahav-philadelphia',

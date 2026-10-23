@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect, useRef } from 'react';
 import {
   Search,
   MapPin,
@@ -7,17 +7,23 @@ import {
   StickyNote,
   AlertCircle,
   Loader2,
-  Plus,
-  Compass,
+  Navigation,
   RotateCcw
 } from 'lucide-react';
-import { Restaurant, SavedList } from '../types';
-import { POPULAR_US_CITIES, validateUsLocation } from '../data/usRestaurantsCatalog';
+import { Restaurant, SavedList, DEFAULT_FALLBACK_LOCATION } from '../types';
+import {
+  validateUsLocation,
+  scoreRestaurantMatch
+} from '../data/usRestaurantsCatalog';
+import { RestaurantThumb } from './RestaurantThumb';
 
 interface SearchViewProps {
   restaurantsMap: Record<string, Restaurant>;
   lists: SavedList[];
   defaultLocation: string;
+  isLocatingUser: boolean;
+  userGeminiApiKey: string;
+  onRequestUserLocation: () => void;
   onOpenSaveModal: (restaurant: Restaurant) => void;
   onRegisterDiscoveredRestaurants: (newRestaurants: Restaurant[]) => void;
 }
@@ -26,94 +32,157 @@ export const SearchView: React.FC<SearchViewProps> = ({
   restaurantsMap,
   lists,
   defaultLocation,
+  isLocatingUser,
+  userGeminiApiKey,
+  onRequestUserLocation,
   onOpenSaveModal,
   onRegisterDiscoveredRestaurants
 }) => {
   const [searchQuery, setSearchQuery] = useState('');
-  const [locationInput, setLocationInput] = useState(defaultLocation || 'All United States');
+  const [locationInput, setLocationInput] = useState(
+    defaultLocation || DEFAULT_FALLBACK_LOCATION
+  );
   const [isSearchingLive, setIsSearchingLive] = useState(false);
   const [locationError, setLocationError] = useState<string | null>(null);
-  const [liveStatusMessage, setLiveStatusMessage] = useState<string | null>(null);
   const [liveSearchIds, setLiveSearchIds] = useState<string[] | null>(null);
+  const [hasSearched, setHasSearched] = useState(false);
 
-  // Manual custom restaurant quick-add form
-  const [showCustomForm, setShowCustomForm] = useState(false);
-  const [customName, setCustomName] = useState('');
-  const [customCuisine, setCustomCuisine] = useState('');
-  const [customCity, setCustomCity] = useState('');
-  const [customState, setCustomState] = useState('');
-  const [customYelpUrl, setCustomYelpUrl] = useState('');
-  const [customYelpRating, setCustomYelpRating] = useState('4.5');
+  const debounceTimerRef = useRef<number | null>(null);
+  const latestRequestIdRef = useRef<number>(0);
+
+  // Sync location input whenever defaultLocation changes (e.g. from Geolocation or Settings)
+  useEffect(() => {
+    if (defaultLocation) {
+      setLocationInput(defaultLocation);
+    }
+  }, [defaultLocation]);
 
   const allRestaurants = useMemo(() => Object.values(restaurantsMap), [restaurantsMap]);
 
-  // Filter local U.S. catalog for instant results
-  const filteredRestaurants = useMemo(() => {
-    if (liveSearchIds && liveSearchIds.length > 0) {
-      const liveMatches = liveSearchIds
-        .map((id) => restaurantsMap[id])
-        .filter((r): r is Restaurant => Boolean(r));
-      if (liveMatches.length > 0) {
-        return liveMatches;
-      }
-    }
+  // Match local restaurants when the user has typed a search query
+  const localFuzzyMatches = useMemo(() => {
+    const trimmedQ = searchQuery.trim();
+    if (!trimmedQ) return [];
 
-    const q = searchQuery.trim().toLowerCase();
     const loc = locationInput.trim().toLowerCase();
     const isAllUs =
-      !loc || loc === 'all united states' || loc === 'united states' || loc === 'usa' || loc === 'us';
+      !loc ||
+      loc === 'all united states' ||
+      loc === 'united states' ||
+      loc === 'usa' ||
+      loc === 'us';
 
-    return allRestaurants.filter((r) => {
-      const matchesQuery =
-        !q ||
-        r.name.toLowerCase().includes(q) ||
-        r.cuisineType.toLowerCase().includes(q) ||
-        (r.neighborhood && r.neighborhood.toLowerCase().includes(q)) ||
-        (r.highlights && r.highlights.some((h) => h.toLowerCase().includes(q)));
+    const isNycMetro =
+      loc.includes('new york') || loc === 'nyc' || loc.includes('brooklyn');
 
+    const scored: Array<{ restaurant: Restaurant; score: number }> = [];
+
+    for (const r of allRestaurants) {
       const matchesLoc =
         isAllUs ||
+        (isNycMetro && r.state.toLowerCase() === 'ny') ||
         `${r.city}, ${r.state}`.toLowerCase().includes(loc) ||
         r.city.toLowerCase().includes(loc) ||
+        (r.neighborhood && r.neighborhood.toLowerCase().includes(loc)) ||
         r.state.toLowerCase() === loc ||
         r.zipCode.includes(loc);
 
-      return matchesQuery && matchesLoc;
+      if (!matchesLoc) continue;
+
+      const matchScore = scoreRestaurantMatch(r, trimmedQ);
+      if (matchScore > 0) {
+        scored.push({ restaurant: r, score: matchScore });
+      }
+    }
+
+    return scored
+      .sort((a, b) => b.score - a.score || b.restaurant.yelpRating - a.restaurant.yelpRating)
+      .map((item) => item.restaurant);
+  }, [allRestaurants, searchQuery, locationInput]);
+
+  // Displayed results (only shown when user has entered a search query, ranked with exact matches #1)
+  const displayedRestaurants = useMemo(() => {
+    const trimmedQ = searchQuery.trim();
+    if (!trimmedQ) {
+      return [];
+    }
+
+    const candidatesMap = new Map<string, { restaurant: Restaurant; liveOrderIndex: number }>();
+
+    if (liveSearchIds && liveSearchIds.length > 0) {
+      liveSearchIds.forEach((id, index) => {
+        const r = restaurantsMap[id];
+        if (r) {
+          candidatesMap.set(r.id, { restaurant: r, liveOrderIndex: index });
+        }
+      });
+    }
+
+    localFuzzyMatches.forEach((r, index) => {
+      if (!candidatesMap.has(r.id)) {
+        candidatesMap.set(r.id, { restaurant: r, liveOrderIndex: 100 + index });
+      }
     });
-  }, [allRestaurants, restaurantsMap, searchQuery, locationInput, liveSearchIds]);
 
-  const handleLiveYelpSearch = async (e?: React.FormEvent) => {
-    if (e) e.preventDefault();
-    setLocationError(null);
-    setLiveStatusMessage(null);
+    const candidates = Array.from(candidatesMap.values());
+    return candidates
+      .sort((a, b) => {
+        const scoreA = scoreRestaurantMatch(a.restaurant, trimmedQ);
+        const scoreB = scoreRestaurantMatch(b.restaurant, trimmedQ);
+        if (scoreB !== scoreA) {
+          return scoreB - scoreA;
+        }
+        if (a.liveOrderIndex !== b.liveOrderIndex) {
+          return a.liveOrderIndex - b.liveOrderIndex;
+        }
+        return b.restaurant.yelpRating - a.restaurant.yelpRating;
+      })
+      .map((entry) => entry.restaurant);
+  }, [searchQuery, localFuzzyMatches, liveSearchIds, restaurantsMap]);
 
-    const locValidation = validateUsLocation(locationInput);
+  const executeLiveSearch = async (queryToRun: string, locationToRun: string) => {
+    const trimmedQ = queryToRun.trim();
+    if (!trimmedQ) {
+      setLiveSearchIds(null);
+      setHasSearched(false);
+      return;
+    }
+
+    const locValidation = validateUsLocation(locationToRun);
     if (!locValidation.valid) {
       setLocationError(locValidation.reason || 'Search is restricted to the United States.');
       return;
     }
 
-    const queryCheck = validateUsLocation(searchQuery);
+    const queryCheck = validateUsLocation(trimmedQ);
     if (!queryCheck.valid) {
       setLocationError(queryCheck.reason || 'Search is restricted to the United States.');
       return;
     }
 
-    if (!searchQuery.trim() && (locationInput === 'All United States' || !locationInput.trim())) {
-      setLiveSearchIds(null);
-      return;
-    }
-
+    const requestId = ++latestRequestIdRef.current;
+    setHasSearched(true);
     setIsSearchingLive(true);
     try {
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json'
+      };
+      if (userGeminiApiKey && userGeminiApiKey.trim()) {
+        headers['x-user-gemini-key'] = userGeminiApiKey.trim();
+      }
+
       const response = await fetch('/api/search', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({
-          query: searchQuery.trim() || 'top rated restaurants',
-          location: locationInput.trim() || 'United States'
+          query: trimmedQ,
+          location: locationToRun.trim() || DEFAULT_FALLBACK_LOCATION
         })
       });
+
+      if (requestId !== latestRequestIdRef.current) {
+        return;
+      }
 
       const data = await response.json();
       if (!response.ok) {
@@ -125,202 +194,74 @@ export const SearchView: React.FC<SearchViewProps> = ({
       if (Array.isArray(data.results) && data.results.length > 0) {
         onRegisterDiscoveredRestaurants(data.results);
         setLiveSearchIds(data.results.map((r: Restaurant) => r.id));
-        setLiveStatusMessage(
-          `Found ${data.results.length} closely matched U.S. restaurants on Yelp for "${
-            searchQuery.trim() || 'popular spots'
-          }" in ${locationInput || 'the United States'}.`
-        );
-      } else {
-        setLiveSearchIds(null);
-        setLiveStatusMessage(
-          'Showing closest matches from our U.S. restaurant directory.'
-        );
       }
     } catch {
-      setLiveSearchIds(null);
-      setLiveStatusMessage('Showing matches from our U.S. restaurant directory.');
+      // Keep local fuzzy matches displayed cleanly
     } finally {
-      setIsSearchingLive(false);
+      if (requestId === latestRequestIdRef.current) {
+        setIsSearchingLive(false);
+      }
     }
   };
 
-  const handleSelectQuickCity = (city: string) => {
-    setLocationInput(city);
-    setLocationError(null);
-    setLiveSearchIds(null);
-    setLiveStatusMessage(null);
-  };
+  // Automatically trigger live U.S. lookup when typing a restaurant name
+  useEffect(() => {
+    if (debounceTimerRef.current) {
+      window.clearTimeout(debounceTimerRef.current);
+    }
 
-  const handleClearSearch = () => {
-    setSearchQuery('');
-    setLocationInput('All United States');
-    setLocationError(null);
-    setLiveSearchIds(null);
-    setLiveStatusMessage(null);
-  };
-
-  const handleAddCustomRestaurant = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!customName.trim() || !customCity.trim() || !customState.trim()) return;
-
-    const locCheck = validateUsLocation(`${customCity}, ${customState}`);
-    if (!locCheck.valid) {
-      setLocationError(locCheck.reason || 'Only U.S. restaurants are supported.');
+    const trimmedQ = searchQuery.trim();
+    if (!trimmedQ) {
+      setLiveSearchIds(null);
+      setHasSearched(false);
       return;
     }
 
-    const id = `${customName}-${customCity}-${customState}`
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, '-')
-      .replace(/^-+|-+$/g, '');
+    if (trimmedQ.length >= 2) {
+      debounceTimerRef.current = window.setTimeout(() => {
+        executeLiveSearch(trimmedQ, locationInput);
+      }, 700);
+    }
 
-    const parsedRating = Math.min(5, Math.max(1, parseFloat(customYelpRating) || 4.5));
-    const cleanUrl =
-      customYelpUrl.trim() && customYelpUrl.trim().startsWith('http')
-        ? customYelpUrl.trim()
-        : `https://www.yelp.com/search?find_desc=${encodeURIComponent(
-            customName.trim()
-          )}&find_loc=${encodeURIComponent(`${customCity.trim()}, ${customState.trim()}`)}`;
-
-    const newRest: Restaurant = {
-      id,
-      name: customName.trim(),
-      cuisineType: customCuisine.trim() || 'American Restaurant',
-      yelpUrl: cleanUrl,
-      yelpRating: parsedRating,
-      reviewCount: 120,
-      price: '$$',
-      address: `${customCity.trim()}`,
-      city: customCity.trim(),
-      state: customState.trim().toUpperCase().slice(0, 2),
-      zipCode: '',
-      highlights: [],
-      userRating: 0,
-      notes: '',
-      willGoBack: ''
+    return () => {
+      if (debounceTimerRef.current) {
+        window.clearTimeout(debounceTimerRef.current);
+      }
     };
+  }, [searchQuery, locationInput]);
 
-    onRegisterDiscoveredRestaurants([newRest]);
-    setShowCustomForm(false);
-    setCustomName('');
-    setCustomCuisine('');
-    setCustomCity('');
-    setCustomState('');
-    setCustomYelpUrl('');
-    onOpenSaveModal(newRest);
+  const handleSearchSubmit = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    setLocationError(null);
+    await executeLiveSearch(searchQuery, locationInput);
+  };
+
+  const handleClearSearch = () => {
+    latestRequestIdRef.current++;
+    setSearchQuery('');
+    setLocationError(null);
+    setLiveSearchIds(null);
+    setHasSearched(false);
+    setIsSearchingLive(false);
   };
 
   const getSavedListsForRestaurant = (restaurantId: string): SavedList[] => {
     return lists.filter((list) => list.items.some((item) => item.restaurantId === restaurantId));
   };
 
+  const isQueryActive = searchQuery.trim().length > 0;
+
   return (
-    <div className="space-y-8">
-      {/* Hero Search Section */}
+    <div className="space-y-6">
+      {/* Clean Search Box Section */}
       <section className="rounded-xl border border-zinc-200 bg-white p-6 md:p-8 shadow-2xs">
-        <div className="flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
-          <div>
-            <div className="text-xs font-medium text-zinc-500">
-              United States Restaurant Discovery & Yelp Logger
-            </div>
-            <h1 className="mt-1 text-2xl font-bold tracking-tight text-zinc-900 md:text-3xl">
-              Find & Star U.S. Restaurants on Yelp
-            </h1>
-            <p className="mt-1.5 max-w-2xl text-sm text-zinc-600">
-              Search any restaurant across all 50 U.S. states. Click the star on any result to save it to{' '}
-              <span className="font-semibold text-zinc-800">&ldquo;Want to Go&rdquo;</span>,{' '}
-              <span className="font-semibold text-zinc-800">&ldquo;Been Here&rdquo;</span>, or your own custom lists with notes and CSV export.
-            </p>
-          </div>
-          <button
-            type="button"
-            onClick={() => setShowCustomForm((prev) => !prev)}
-            className="inline-flex items-center gap-1.5 rounded-lg border border-zinc-300 bg-[#FAF9F6] px-3.5 py-2 text-xs font-semibold text-zinc-800 hover:bg-zinc-100 transition-colors whitespace-nowrap shrink-0 self-start md:self-auto"
-          >
-            <Plus className="h-3.5 w-3.5 text-[#D32323]" />
-            {showCustomForm ? 'Close Manual Entry' : 'Add Custom U.S. Spot'}
-          </button>
-        </div>
+        <h1 className="text-2xl font-bold tracking-tight text-zinc-900 md:text-3xl">
+          Find Restaurants
+        </h1>
 
-        {/* Manual Entry Drawer */}
-        {showCustomForm && (
-          <form
-            onSubmit={handleAddCustomRestaurant}
-            className="mt-5 rounded-lg border border-zinc-200 bg-[#FAF9F6] p-4 space-y-3"
-          >
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-bold text-zinc-900">
-                Quick-Add Any U.S. Restaurant by Name & Yelp URL
-              </span>
-              <span className="text-xs text-zinc-500">U.S. Locations Only</span>
-            </div>
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-6">
-              <input
-                type="text"
-                required
-                value={customName}
-                onChange={(e) => setCustomName(e.target.value)}
-                placeholder="Restaurant Name *"
-                className="lg:col-span-2 rounded-md border border-zinc-300 bg-white px-3 py-2 text-xs text-zinc-900 focus:border-[#D32323] focus:outline-none"
-              />
-              <input
-                type="text"
-                value={customCuisine}
-                onChange={(e) => setCustomCuisine(e.target.value)}
-                placeholder="Type (e.g., Tacos, Sushi)"
-                className="lg:col-span-1 rounded-md border border-zinc-300 bg-white px-3 py-2 text-xs text-zinc-900 focus:border-[#D32323] focus:outline-none"
-              />
-              <input
-                type="text"
-                required
-                value={customCity}
-                onChange={(e) => setCustomCity(e.target.value)}
-                placeholder="U.S. City *"
-                className="lg:col-span-1 rounded-md border border-zinc-300 bg-white px-3 py-2 text-xs text-zinc-900 focus:border-[#D32323] focus:outline-none"
-              />
-              <input
-                type="text"
-                required
-                maxLength={2}
-                value={customState}
-                onChange={(e) => setCustomState(e.target.value)}
-                placeholder="State (e.g. NY) *"
-                className="lg:col-span-1 rounded-md border border-zinc-300 bg-white px-3 py-2 text-xs uppercase text-zinc-900 focus:border-[#D32323] focus:outline-none"
-              />
-              <input
-                type="number"
-                step="0.1"
-                min="1"
-                max="5"
-                value={customYelpRating}
-                onChange={(e) => setCustomYelpRating(e.target.value)}
-                placeholder="Yelp Rating (4.5)"
-                className="lg:col-span-1 rounded-md border border-zinc-300 bg-white px-3 py-2 text-xs font-mono text-zinc-900 focus:border-[#D32323] focus:outline-none"
-              />
-            </div>
-            <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-              <input
-                type="url"
-                value={customYelpUrl}
-                onChange={(e) => setCustomYelpUrl(e.target.value)}
-                placeholder="Optional direct Yelp URL (https://www.yelp.com/biz/...)"
-                className="flex-1 rounded-md border border-zinc-300 bg-white px-3 py-2 text-xs text-zinc-900 focus:border-[#D32323] focus:outline-none"
-              />
-              <button
-                type="submit"
-                className="inline-flex items-center justify-center gap-1.5 rounded-md bg-zinc-900 px-4 py-2 text-xs font-semibold text-white hover:bg-zinc-800 transition-colors whitespace-nowrap shrink-0"
-              >
-                <Star className="h-3.5 w-3.5" />
-                Add & Save to List
-              </button>
-            </div>
-          </form>
-        )}
-
-        {/* Main Search Bar (Yelp-style Dual Input: Find + US Near) */}
-        <form onSubmit={handleLiveYelpSearch} className="mt-6">
+        <form onSubmit={handleSearchSubmit} className="mt-5">
           <div className="flex flex-col gap-3 lg:flex-row lg:items-center">
-            {/* Find: Restaurant Name, Cuisine, Dish */}
+            {/* Find: Restaurant Name or Cuisine */}
             <div className="relative flex-1">
               <Search className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-zinc-400" />
               <input
@@ -330,14 +271,14 @@ export const SearchView: React.FC<SearchViewProps> = ({
                   setSearchQuery(e.target.value);
                   if (liveSearchIds) setLiveSearchIds(null);
                 }}
-                placeholder="Search restaurant name, cuisine, or dish (e.g., Katz's, BBQ, Ramen, Oysters)..."
+                placeholder="Search restaurant name or cuisine (e.g., Esse Taco, Peter Luger's, Katz's)..."
                 aria-label="Search restaurant name or cuisine"
                 className="w-full rounded-lg border border-zinc-300 bg-[#FAF9F6] py-3 pl-10 pr-4 text-sm text-zinc-900 placeholder:text-zinc-400 focus:border-[#D32323] focus:bg-white focus:outline-none"
               />
             </div>
 
-            {/* Near: U.S. City, State, or ZIP Code */}
-            <div className="relative w-full lg:w-72">
+            {/* Near: U.S. City, State, or ZIP Code + Near Me button */}
+            <div className="relative w-full lg:w-80">
               <MapPin className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-[#D32323]" />
               <input
                 type="text"
@@ -347,70 +288,60 @@ export const SearchView: React.FC<SearchViewProps> = ({
                   setLocationError(null);
                   if (liveSearchIds) setLiveSearchIds(null);
                 }}
-                placeholder="U.S. City, State or ZIP (e.g., Austin, TX)"
+                placeholder="U.S. City, State or ZIP"
                 aria-label="United States city, state, or ZIP code"
-                className="w-full rounded-lg border border-zinc-300 bg-[#FAF9F6] py-3 pl-10 pr-4 text-sm text-zinc-900 placeholder:text-zinc-400 focus:border-[#D32323] focus:bg-white focus:outline-none"
+                className="w-full rounded-lg border border-zinc-300 bg-[#FAF9F6] py-3 pl-10 pr-24 text-sm text-zinc-900 placeholder:text-zinc-400 focus:border-[#D32323] focus:bg-white focus:outline-none"
               />
+              <button
+                type="button"
+                onClick={onRequestUserLocation}
+                disabled={isLocatingUser}
+                title="Use my current location"
+                className="absolute right-2 top-1/2 -translate-y-1/2 inline-flex items-center gap-1 rounded-md bg-white border border-zinc-200 px-2 py-1 text-[11px] font-semibold text-zinc-700 hover:border-[#D32323] hover:text-[#D32323] transition-colors whitespace-nowrap shrink-0"
+              >
+                {isLocatingUser ? (
+                  <Loader2 className="h-3 w-3 animate-spin text-[#D32323]" />
+                ) : (
+                  <Navigation className="h-3 w-3 text-[#D32323]" />
+                )}
+                <span>{isLocatingUser ? 'Locating' : 'Near Me'}</span>
+              </button>
             </div>
 
-            {/* Submit Live Yelp Search */}
+            {/* Submit Search */}
             <div className="flex items-center gap-2">
               <button
                 type="submit"
-                disabled={isSearchingLive}
-                className="inline-flex flex-1 lg:flex-initial items-center justify-center gap-2 rounded-lg bg-[#D32323] px-5 py-3 text-sm font-semibold text-white hover:bg-[#b81d1d] disabled:opacity-60 transition-colors whitespace-nowrap shrink-0"
+                disabled={isSearchingLive || !searchQuery.trim()}
+                className="inline-flex flex-1 lg:flex-initial items-center justify-center gap-2 rounded-lg bg-[#D32323] px-6 py-3 text-sm font-semibold text-white hover:bg-[#b81d1d] disabled:opacity-50 transition-colors whitespace-nowrap shrink-0"
               >
                 {isSearchingLive ? (
                   <>
                     <Loader2 className="h-4 w-4 animate-spin" />
-                    Searching Yelp US...
+                    Searching...
                   </>
                 ) : (
                   <>
-                    <Compass className="h-4 w-4" />
-                    Search Yelp (US)
+                    <Search className="h-4 w-4" />
+                    Search
                   </>
                 )}
               </button>
 
-              {(searchQuery || locationInput !== 'All United States' || liveSearchIds) && (
+              {isQueryActive && (
                 <button
                   type="button"
                   onClick={handleClearSearch}
                   className="inline-flex items-center justify-center gap-1 rounded-lg border border-zinc-300 bg-white px-3.5 py-3 text-xs font-semibold text-zinc-700 hover:bg-zinc-50 transition-colors whitespace-nowrap shrink-0"
-                  title="Reset search filters"
+                  title="Clear search"
                 >
                   <RotateCcw className="h-4 w-4" />
-                  Reset
+                  Clear
                 </button>
               )}
             </div>
           </div>
         </form>
-
-        {/* Quick U.S. City Filter Bar */}
-        <div className="mt-4 flex items-center gap-1.5 overflow-x-auto pb-1">
-          <span className="text-xs font-medium text-zinc-400 mr-1 whitespace-nowrap shrink-0">
-            U.S. Cities:
-          </span>
-          {POPULAR_US_CITIES.map((city) => {
-            const active = locationInput.toLowerCase() === city.toLowerCase();
-            return (
-              <button
-                key={city}
-                type="button"
-                onClick={() => handleSelectQuickCity(city)}
-                className={`rounded-md px-2.5 py-1 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
-                  active
-                    ? 'bg-zinc-900 text-white'
-                    : 'bg-[#FAF9F6] text-zinc-600 hover:bg-zinc-200/70 hover:text-zinc-900'
-                }`}
-              >
-                {city}
-              </button>
-            );
-          })}
-        </div>
 
         {/* Validation Error for Non-US Searches */}
         {locationError && (
@@ -425,132 +356,167 @@ export const SearchView: React.FC<SearchViewProps> = ({
             </div>
           </div>
         )}
-
-        {/* Live Search Grounding Status */}
-        {liveStatusMessage && !locationError && (
-          <div className="mt-4 flex items-center justify-between gap-2 rounded-lg border border-zinc-200 bg-[#FAF9F6] px-3.5 py-2 text-xs text-zinc-700">
-            <span>{liveStatusMessage}</span>
-            {liveSearchIds && (
-              <button
-                type="button"
-                onClick={() => {
-                  setLiveSearchIds(null);
-                  setLiveStatusMessage(null);
-                }}
-                className="font-semibold text-[#D32323] hover:underline whitespace-nowrap shrink-0"
-              >
-                Show All Directory Spots
-              </button>
-            )}
-          </div>
-        )}
       </section>
 
-      {/* Search Results Section */}
-      <section className="space-y-4">
-        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-zinc-200 pb-3">
-          <div>
-            <h2 className="text-lg font-bold text-zinc-900">
-              U.S. Restaurant Results
+      {/* Search Results Section (1 Skinny Line Per Result Stacked) */}
+      {isQueryActive && (
+        <section className="space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2 px-1">
+            <h2 className="text-sm font-bold text-zinc-900">
+              Results for &ldquo;{searchQuery.trim()}&rdquo;
             </h2>
-            <p className="text-xs text-zinc-500">
-              Click the <strong className="text-zinc-800">★ Star</strong> on any restaurant card to add it to one or multiple lists and write a note.
-            </p>
-          </div>
-          <div className="text-xs font-mono text-zinc-600 tabular-nums">
-            Showing {filteredRestaurants.length} U.S. restaurant{filteredRestaurants.length === 1 ? '' : 's'}
-          </div>
-        </div>
-
-        {filteredRestaurants.length === 0 ? (
-          <div className="rounded-xl border border-zinc-200 bg-white p-10 text-center">
-            <p className="text-base font-semibold text-zinc-900">
-              No local directory matches for &ldquo;{searchQuery || locationInput}&rdquo;
-            </p>
-            <p className="mx-auto mt-1 max-w-md text-xs text-zinc-500">
-              Click the button below to search Yelp&apos;s live United States restaurant index for{' '}
-              <strong>{searchQuery || 'restaurants'}</strong> in{' '}
-              <strong>{locationInput || 'the United States'}</strong>.
-            </p>
-            <div className="mt-4 flex items-center justify-center gap-3">
-              <button
-                type="button"
-                onClick={() => handleLiveYelpSearch()}
-                disabled={isSearchingLive}
-                className="inline-flex items-center gap-2 rounded-lg bg-[#D32323] px-4 py-2.5 text-xs font-semibold text-white hover:bg-[#b81d1d] transition-colors"
-              >
-                {isSearchingLive ? (
-                  <>
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                    Searching Live Yelp US...
-                  </>
-                ) : (
-                  <>
-                    <Compass className="h-4 w-4" />
-                    Search Live Yelp US Index
-                  </>
-                )}
-              </button>
-              <button
-                type="button"
-                onClick={handleClearSearch}
-                className="rounded-lg border border-zinc-300 bg-white px-4 py-2.5 text-xs font-semibold text-zinc-700 hover:bg-zinc-50 transition-colors"
-              >
-                View All U.S. Spots
-              </button>
+            <div className="text-xs font-mono text-zinc-500 tabular-nums">
+              {isSearchingLive
+                ? 'Searching...'
+                : `${displayedRestaurants.length} result${
+                    displayedRestaurants.length === 1 ? '' : 's'
+                  }`}
             </div>
           </div>
-        ) : (
-          <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-            {filteredRestaurants.map((restaurant) => {
-              const savedInLists = getSavedListsForRestaurant(restaurant.id);
-              const isSaved = savedInLists.length > 0;
 
-              return (
-                <article
-                  key={restaurant.id}
-                  className="flex flex-col justify-between rounded-xl border border-zinc-200 bg-white p-5 transition-colors hover:border-zinc-300"
-                >
-                  <div>
-                    {/* Top Row: Title + Quick-Add Star Button */}
-                    <div className="flex items-start justify-between gap-4">
-                      <div className="min-w-0">
-                        <div className="flex items-center gap-1.5 text-xs text-zinc-500">
-                          <span>{restaurant.cuisineType}</span>
-                          <span aria-hidden="true">·</span>
-                          <span className="font-mono">{restaurant.price}</span>
-                          <span aria-hidden="true">·</span>
-                          <span>
-                            {restaurant.city}, {restaurant.state}
-                          </span>
-                        </div>
+          {displayedRestaurants.length === 0 ? (
+            <div className="rounded-xl border border-zinc-200 bg-white p-10 text-center">
+              {isSearchingLive || !hasSearched ? (
+                <div className="flex flex-col items-center justify-center space-y-2">
+                  <Loader2 className="h-6 w-6 animate-spin text-[#D32323]" />
+                  <p className="text-sm font-semibold text-zinc-900">
+                    Searching U.S. restaurants for &ldquo;{searchQuery}&rdquo;...
+                  </p>
+                </div>
+              ) : (
+                <>
+                  <p className="text-base font-semibold text-zinc-900">
+                    No U.S. restaurants found for &ldquo;{searchQuery}&rdquo; in {locationInput}
+                  </p>
+                  <p className="mx-auto mt-1 max-w-md text-xs text-zinc-500">
+                    Try checking the spelling or searching across all 50 U.S. states.
+                  </p>
+                  {locationInput.toLowerCase() !== 'all united states' && (
+                    <div className="mt-4 flex justify-center">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setLocationInput('All United States');
+                          executeLiveSearch(searchQuery, 'All United States');
+                        }}
+                        className="rounded-lg bg-[#D32323] px-4 py-2 text-xs font-semibold text-white hover:bg-[#b81d1d] transition-colors"
+                      >
+                        Search &ldquo;{searchQuery}&rdquo; Across All U.S. States
+                      </button>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          ) : (
+            <div className="divide-y divide-zinc-200 rounded-xl border border-zinc-200 bg-white overflow-hidden shadow-2xs">
+              {displayedRestaurants.map((restaurant) => {
+                const savedInLists = getSavedListsForRestaurant(restaurant.id);
+                const isSaved = savedInLists.length > 0;
 
-                        <h3 className="mt-1 text-lg font-bold text-zinc-900">
+                return (
+                  <div
+                    key={restaurant.id}
+                    className="flex items-center justify-between gap-3.5 px-4 py-3 hover:bg-[#FAF9F6] transition-colors"
+                  >
+                    {/* Left: Small Preview Picture + Stacked Name / Type & Price / Address */}
+                    <div className="flex min-w-0 flex-1 items-center gap-3.5">
+                      <RestaurantThumb restaurant={restaurant} />
+
+                      <div className="min-w-0 flex-1">
+                        {/* Line 1: Restaurant Name + Yelp Rating */}
+                        <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
                           <a
                             href={restaurant.yelpUrl}
                             target="_blank"
                             rel="noopener noreferrer"
-                            className="hover:text-[#D32323] transition-colors"
+                            className="truncate text-sm sm:text-base font-bold text-zinc-900 hover:text-[#D32323] transition-colors"
                           >
                             {restaurant.name}
                           </a>
-                        </h3>
-                      </div>
 
-                      {/* Requirement 9: Star on each search result to quickly add to 1 or more lists */}
+                          <span className="inline-flex items-center gap-1 font-mono text-xs font-bold text-[#D32323] tabular-nums shrink-0">
+                            ★ {restaurant.yelpRating.toFixed(1)}
+                            <span className="font-normal text-zinc-400">
+                              ({restaurant.reviewCount.toLocaleString()})
+                            </span>
+                          </span>
+
+                          {restaurant.userRating > 0 && (
+                            <span className="font-mono text-xs font-semibold text-amber-700 tabular-nums shrink-0">
+                              · My ★ {restaurant.userRating}/5
+                            </span>
+                          )}
+
+                          {isSaved && (
+                            <span className="text-xs text-zinc-500 truncate hidden md:inline">
+                              · In:{' '}
+                              <strong className="font-medium text-zinc-800">
+                                {savedInLists.map((l) => l.name).join(', ')}
+                              </strong>
+                            </span>
+                          )}
+                        </div>
+
+                        {/* Line 2 (Underneath Name): Type of Restaurant & How Expensive */}
+                        <div className="mt-0.5 flex items-center gap-1.5 text-xs text-zinc-700 truncate">
+                          <span className="truncate font-medium">{restaurant.cuisineType}</span>
+                          <span className="text-zinc-300 shrink-0" aria-hidden="true">
+                            ·
+                          </span>
+                          <span className="font-mono font-semibold text-zinc-900 shrink-0">
+                            {restaurant.price}
+                          </span>
+                        </div>
+
+                        {/* Line 3 (Underneath Type & Price): Street Address */}
+                        <div className="mt-0.5 flex items-center gap-2 text-xs text-zinc-500 truncate">
+                          <span className="truncate">
+                            {restaurant.address ? `${restaurant.address}, ` : ''}
+                            {restaurant.city}, {restaurant.state}
+                            {restaurant.zipCode ? ` ${restaurant.zipCode}` : ''}
+                            {restaurant.neighborhood ? ` · ${restaurant.neighborhood}` : ''}
+                          </span>
+
+                          {restaurant.notes && (
+                            <span
+                              title={`Note: ${restaurant.notes}`}
+                              className="inline-flex items-center gap-1 text-zinc-600 truncate max-w-[200px] hidden lg:inline-flex"
+                            >
+                              <StickyNote className="h-3 w-3 shrink-0 text-zinc-400" />
+                              <span className="truncate">{restaurant.notes}</span>
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Right: Direct Yelp Link + Quick-Add Star Button */}
+                    <div className="flex items-center gap-2 shrink-0">
+                      <a
+                        href={restaurant.yelpUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex items-center gap-1 rounded-md px-2.5 py-1.5 text-xs font-semibold text-[#D32323] hover:bg-[#D32323]/5 hover:underline whitespace-nowrap shrink-0"
+                        title="Open Yelp page"
+                      >
+                        <span>Yelp</span>
+                        <ExternalLink className="h-3 w-3" />
+                      </a>
+
                       <button
                         type="button"
                         onClick={() => onOpenSaveModal(restaurant)}
                         aria-label={`Save ${restaurant.name} to lists`}
                         title="Star to save or manage lists & note"
-                        className={`group flex items-center gap-1.5 rounded-lg border px-3 py-2 text-xs font-semibold transition-all whitespace-nowrap shrink-0 ${
+                        className={`group inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs font-semibold transition-all whitespace-nowrap shrink-0 ${
                           isSaved
                             ? 'border-[#D32323] bg-[#D32323]/10 text-[#D32323]'
                             : 'border-zinc-200 bg-[#FAF9F6] text-zinc-700 hover:border-[#D32323] hover:text-[#D32323]'
                         }`}
                       >
                         <Star
-                          className={`h-4 w-4 transition-transform group-hover:scale-110 ${
+                          className={`h-3.5 w-3.5 transition-transform group-hover:scale-110 ${
                             isSaved
                               ? 'fill-[#D32323] text-[#D32323]'
                               : 'text-zinc-400 group-hover:text-[#D32323]'
@@ -559,105 +525,13 @@ export const SearchView: React.FC<SearchViewProps> = ({
                         <span>{isSaved ? `Saved (${savedInLists.length})` : 'Save'}</span>
                       </button>
                     </div>
-
-                    {/* Yelp Rating Row + Address */}
-                    <div className="mt-2.5 flex flex-wrap items-center gap-y-1 text-xs text-zinc-600">
-                      <div className="flex items-center gap-1.5 font-mono tabular-nums">
-                        <span className="inline-flex items-center gap-1 font-bold text-[#D32323]">
-                          ★ {restaurant.yelpRating.toFixed(1)}
-                        </span>
-                        <span className="text-zinc-500">
-                          ({restaurant.reviewCount.toLocaleString()} Yelp reviews)
-                        </span>
-                      </div>
-
-                      {restaurant.userRating > 0 && (
-                        <>
-                          <span className="mx-2 text-zinc-300" aria-hidden="true">
-                            ·
-                          </span>
-                          <span className="font-mono font-semibold text-amber-700 tabular-nums">
-                            My Rating: ★ {restaurant.userRating}/5
-                          </span>
-                        </>
-                      )}
-
-                      {restaurant.willGoBack && (
-                        <>
-                          <span className="mx-2 text-zinc-300" aria-hidden="true">
-                            ·
-                          </span>
-                          <span
-                            className={`font-mono font-semibold ${
-                              restaurant.willGoBack === 'Y' ? 'text-emerald-700' : 'text-rose-700'
-                            }`}
-                          >
-                            Will Go Back: {restaurant.willGoBack}
-                          </span>
-                        </>
-                      )}
-                    </div>
-
-                    {/* Street Address & Neighborhood */}
-                    <div className="mt-1.5 text-xs text-zinc-500">
-                      {restaurant.neighborhood ? `${restaurant.neighborhood} · ` : ''}
-                      {restaurant.address}, {restaurant.city}, {restaurant.state}{' '}
-                      {restaurant.zipCode}
-                    </div>
-
-                    {/* Popular Yelp Dish Highlights */}
-                    {restaurant.highlights && restaurant.highlights.length > 0 && (
-                      <div className="mt-2.5 text-xs text-zinc-600">
-                        <span className="font-medium text-zinc-800">Yelp Highlights: </span>
-                        <span>{restaurant.highlights.join(' · ')}</span>
-                      </div>
-                    )}
-
-                    {/* Synced Note Preview if present */}
-                    {restaurant.notes && (
-                      <div className="mt-3 rounded-lg border border-zinc-200 bg-[#FAF9F6] px-3 py-2 text-xs text-zinc-700">
-                        <div className="flex items-start gap-1.5">
-                          <StickyNote className="mt-0.5 h-3.5 w-3.5 shrink-0 text-zinc-400" />
-                          <div>
-                            <span className="font-semibold text-zinc-900">My Note: </span>
-                            <span>{restaurant.notes}</span>
-                          </div>
-                        </div>
-                      </div>
-                    )}
                   </div>
-
-                  {/* Card Footer: Saved Lists Summary + Direct Yelp Page Link */}
-                  <div className="mt-4 flex items-center justify-between gap-3 border-t border-zinc-100 pt-3 text-xs">
-                    <div className="min-w-0 truncate text-zinc-500">
-                      {isSaved ? (
-                        <span>
-                          In:{' '}
-                          <strong className="font-medium text-zinc-800">
-                            {savedInLists.map((l) => l.name).join(' · ')}
-                          </strong>
-                        </span>
-                      ) : (
-                        <span>Not in any list yet</span>
-                      )}
-                    </div>
-
-                    <a
-                      href={restaurant.yelpUrl}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="inline-flex items-center gap-1 font-semibold text-[#D32323] hover:underline whitespace-nowrap shrink-0"
-                    >
-                      <span>View on Yelp</span>
-                      <ExternalLink className="h-3.5 w-3.5" />
-                    </a>
-                  </div>
-                </article>
-              );
-            })}
-          </div>
-        )}
-      </section>
+                );
+              })}
+            </div>
+          )}
+        </section>
+      )}
     </div>
   );
 };
